@@ -28,6 +28,15 @@
                     android:textColor="#fff"
                     android:layout_margin="16dp"
                     android:layout_height="wrap_content" />
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/status_label"
+                    android:layout_width="match_parent"
+                    android:layout_height="360dp"
+                    android:textColor="@color/white"
+                    android:layout_weight="1"
+                    android:text=""
+                    android:textAlignment="center"
+                    android:textSize="16sp" />
             </FrameLayout>
         </LinearLayout>
     </androidx.coordinatorlayout.widget.CoordinatorLayout>

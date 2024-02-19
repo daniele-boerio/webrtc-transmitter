@@ -6,7 +6,10 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Bundle
+import android.os.Handler
 import android.util.Log
+import android.view.View
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -30,8 +33,13 @@ import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
+import org.webrtc.PeerConnection.IceConnectionState
+import org.webrtc.PeerConnection.IceGatheringState
+import org.webrtc.PeerConnection.IceServer
+import org.webrtc.PeerConnection.SignalingState
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.PeerConnectionFactory.InitializationOptions
+import org.webrtc.RtpReceiver
 import org.webrtc.RtpTransceiver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
@@ -39,6 +47,7 @@ import org.webrtc.VideoCapturer
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import java.net.URISyntaxException
+import java.util.Arrays
 
 
 class MainActivity : AppCompatActivity() {
@@ -53,10 +62,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
-
     private val authCode = "tokenDiAuth"    //todo
     private val peerID = android.os.Build.MODEL //todo
     private val room = "STANZA" //todo
+
     private lateinit var socket: Socket
     private lateinit var options : IO.Options
 
@@ -76,6 +85,31 @@ class MainActivity : AppCompatActivity() {
     private lateinit var factory: PeerConnectionFactory
     private lateinit var videoTrackFromCamera: VideoTrack
 
+    private var mState = SigState.Disconnected
+
+    // For WebSocket connection retry
+    private val MAX_WS_CONNECT_RETRY_CNT = 3
+    private val WS_CONNECT_RETRY_WAITTIME: Long = 5000
+    private var mNeedRetry = false
+    private var mRetryCounter = 0
+    private var mHandler: Handler? = null
+
+    //enum for signaling state
+    private enum class SigState {
+        Disconnected,
+        Connecting,
+        Connected,
+        Created,
+        Joining,
+        Joined,
+        Full,
+        Offering,
+        ReceivedOffer,
+        ReceivedAnswer,
+        ReceivedCandidate,
+        CreatingAnswer,
+        Done
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -84,18 +118,23 @@ class MainActivity : AppCompatActivity() {
         start()
     }
 
-    override fun onStop() {
-        super.onStop()
+    override fun onDestroy() {
+        super.onDestroy()
+
+        /*
+         * Connection with the signaling server terminated
+         */
+        mNeedRetry = false
+        mRetryCounter = 0
         socket.disconnect()
+
         peerConnection.dispose()
         factory.dispose()
     }
 
     private fun start() {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        // Set the audio stream to STREAM_MUSIC to use the media speaker
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
 
+        //if camera has mic and video permission start the process
         if(hasPermissions()){
             initializeSurfaceViews()
             initializePeerConnectionFactory()
@@ -103,15 +142,41 @@ class MainActivity : AppCompatActivity() {
             initializePeerConnections()
             connectToSignallingServer()
 
+            mNeedRetry = true
+            mRetryCounter = 0
+            mHandler = Handler()
+
         }else{
             requestPermissions()
         }
     }
 
+    //restart all the process if someone disconnect from the call
+    private fun restart(){
+        initializeVariables()
+        clearview()
+        initializePeerConnectionFactory()
+        createVideoTrackFromCameraAndShowIt()
+        initializePeerConnections()
+        connectToSignallingServer()
+    }
+
+    private fun initializeVariables(){
+        mNeedRetry = false
+        mRetryCounter = 0
+        isInitiator = false
+        isChannelReady = false
+        isStarted = false
+        socket.disconnect()
+        peerConnection.dispose()
+        factory.dispose()
+    }
+    private fun clearview(){
+        binding.statusLabel.text = ""
+    }
+
     private fun connectToSignallingServer() {
         try {
-            /*val url = "http://192.168.1.92:3000"
-            socket = IO.socket(url)*/
             val url = "https://develop.ewlab.di.unimi.it/"
 
             options = IO.Options.builder()
@@ -131,31 +196,29 @@ class MainActivity : AppCompatActivity() {
 
                 Log.d(tag,"connectToSignallingServer: connect")
                 socket.emit("create or join", room)
+                mNeedRetry = false
+                changeState(SigState.Connected)
 
             }.on("created") {
 
                 Log.d(tag,"connectToSignallingServer: created")
                 isInitiator = true
+                changeState(SigState.Created)
 
             }.on("full") {
 
                 Log.d(tag,"connectToSignallingServer: full")
+                changeState(SigState.Full)
 
             }.on("join") {
 
                 Log.d(tag,"connectToSignallingServer: join")
                 isChannelReady = true
-                startStreamingVideo()
+                changeState(SigState.Joining)
 
-            }.on("joined") {
-
-                Log.d(tag,"connectToSignallingServer: joined")
-                isChannelReady = true
-
-            }.on("log") { args: Array<Any> ->
-
-                for (arg in args) {
-                    Log.d(tag,"connectToSignallingServer: $arg")
+                //if the call isn't started yet, start the transmission
+                if (!isStarted){
+                    startStreamingVideo()
                 }
 
             }.on("message") { args: Array<Any> ->
@@ -163,22 +226,31 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val message = args[0] as JSONObject
                     if (message.getString("type") == "offer") {
-                        Log.d(
-                            tag,
-                            "connectToSignallingServer: received an offer $isInitiator $isStarted"
-                        )
+                        //received an offer, set the remote description and do an answer
+                        Log.d(tag,"connectToSignallingServer: received an offer $message")
+                        changeState(SigState.CreatingAnswer)
                         if (!isInitiator && !isStarted) {
                             maybeStart()
                         }
                         peerConnection.setRemoteDescription(
-                            SimpleSdpObserver(),
+                            object : SimpleSdpObserver() {
+
+                                override fun onSetFailure(s: String) {
+                                    Log.d(tag, "onSetFailure: $s")
+                                }
+
+                                override fun onSetSuccess() {
+                                    doAnswer()
+                                }
+                            },
                             SessionDescription(
                                 SessionDescription.Type.OFFER,
                                 message.getString("sdp")
                             )
                         )
-                        doAnswer()
                     } else if (message.getString("type") == "answer" && isStarted) {
+                        //received an answer, set the remote description
+                        changeState(SigState.ReceivedAnswer)
                         Log.d(tag,"connectToSignallingServer: received an answer $message")
                         peerConnection.setRemoteDescription(
                             SimpleSdpObserver(),
@@ -188,10 +260,9 @@ class MainActivity : AppCompatActivity() {
                             )
                         )
                     } else if (message.getString("type") == "candidate" && isStarted) {
-                        Log.d(
-                            tag,
-                            "connectToSignallingServer: receiving candidates $message"
-                        )
+                        //received a candidate, add the candidate to the peerConnection
+                        Log.d(tag,"connectToSignallingServer: receiving candidates")
+                        changeState(SigState.ReceivedCandidate)
                         val candidate = IceCandidate(
                             message.getString("id"),
                             message.getInt("label"),
@@ -206,10 +277,8 @@ class MainActivity : AppCompatActivity() {
             }.on(
                 Socket.EVENT_DISCONNECT
             ) {
-                Log.d(
-                    tag,
-                    "connectToSignallingServer: disconnect"
-                )
+                Log.d(tag,"connectToSignallingServer: disconnect")
+                disconnected()
             }
             socket.connect()
         } catch (e: URISyntaxException) {
@@ -218,26 +287,48 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    //MirtDPM4
+    private fun disconnected(){
+        // Retry at connection failure, after specified seconds
+        if (mNeedRetry) {
+            if (++mRetryCounter < MAX_WS_CONNECT_RETRY_CNT) {
+                val retryConnection = Runnable {
+                    connectToSignallingServer()
+                }
+                mHandler?.postDelayed(retryConnection, WS_CONNECT_RETRY_WAITTIME)
+            }else{
+                restart()
+            }
+        }else{
+            restart()
+        }
+    }
+
     private fun doAnswer() {
+        //set the local description and send the answer to the sender
+        val sdpMediaConstraints = MediaConstraints()
         peerConnection.createAnswer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
-                peerConnection.setLocalDescription(SimpleSdpObserver(), sessionDescription)
-                val message = JSONObject()
-                try {
-                    message.put("type", "answer")
-                    message.put("room", room)
-                    message.put("sdp", sessionDescription.description)
-                    sendMessage(message)
-                } catch (e: JSONException) {
-                    e.printStackTrace()
-                    Log.e(tag, e.toString())
-                }
+                peerConnection.setLocalDescription(object : SimpleSdpObserver() {
+                    override fun onSetSuccess() {
+                        val message = JSONObject()
+                        try {
+                            message.put("type", "answer")
+                            message.put("room", room)
+                            message.put("sdp", sessionDescription.description)
+                            Log.d(tag, "answer sent: $message")
+                            sendMessage(message)
+                        } catch (e: JSONException) {
+                            e.printStackTrace()
+                            Log.e(tag, e.toString())
+                        }
+                    }
+                }, sessionDescription)
             }
-        }, MediaConstraints())
+        }, sdpMediaConstraints)
     }
 
     private fun maybeStart() {
+        //if the channel is ready, it's not started and i'm the initiator, create an offer
         Log.d(tag, "maybeStart: $isStarted $isChannelReady")
         if (!isStarted && isChannelReady) {
             isStarted = true
@@ -248,14 +339,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun doCall() {
-        val sdpMediaConstraints = MediaConstraints()
-        sdpMediaConstraints.mandatory.add(
-            MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true")
-        )
-        /*  video from peer */
-        sdpMediaConstraints.mandatory.add(
-            MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true")
-        )
+        //create an offer and send it
+        changeState(SigState.Offering)
         peerConnection.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
                 Log.d(tag, "onCreateSuccess: ")
@@ -265,13 +350,14 @@ class MainActivity : AppCompatActivity() {
                     message.put("type", "offer")
                     message.put("room", room)
                     message.put("sdp", sessionDescription.description)
+                    Log.d(tag, "created an offer $message")
                     sendMessage(message)
                 } catch (e: JSONException) {
                     e.printStackTrace()
                     Log.e(tag, e.toString())
                 }
             }
-        }, sdpMediaConstraints)
+        }, MediaConstraints())
     }
 
     private fun sendMessage(message: Any) {
@@ -340,85 +426,94 @@ class MainActivity : AppCompatActivity() {
         peerConnection.addTrack(videoTrackFromCamera, listOf(mediaStream.id)) // Add the video track
         peerConnection.addTrack(localAudioTrack, listOf(mediaStream.id)) // Add the audio track
 
+        //IMPORTANT -> set the transceiver for letting know the peerConnection that we are sending and we want audio and sending video but not expecting that
+
+        val audioTransceiver = peerConnection.addTransceiver(localAudioTrack)
+
+        val videoTransceiver  = peerConnection.addTransceiver(videoTrackFromCamera)
+
+        audioTransceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+
+        videoTransceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.INACTIVE)
+
+
+        Log.d(tag, "mediaStreamTrack: ${mediaStream.audioTracks}")
+
         maybeStart()
     }
 
 
     private fun createPeerConnection(factory: PeerConnectionFactory?): PeerConnection? {
-        val iceServers = mutableListOf<PeerConnection.IceServer>()
-        val url = "stun:stun.l.google.com:19302"
-        iceServers.add(PeerConnection.IceServer.builder(url).createIceServer())
-        val rtcConfig = PeerConnection.RTCConfiguration(iceServers)
-        val pcConstraints = MediaConstraints()
-        val pcObserver: PeerConnection.Observer =
-            object : PeerConnection.Observer {
-                override fun onSignalingChange(signalingState: PeerConnection.SignalingState) {
-                    Log.d(tag, "onSignalingChange: $signalingState")
-                }
+        val pcObserver: PeerConnection.Observer = object : PeerConnection.Observer {
+            override fun onSignalingChange(signalingState: SignalingState) {
+                Log.d(tag, "onSignalingChange: $signalingState")
+            }
 
-                override fun onIceConnectionChange(iceConnectionState: PeerConnection.IceConnectionState) {
-                    Log.d(tag, "onIceConnectionChange: $iceConnectionState")
-                }
+            override fun onIceConnectionChange(iceConnectionState: IceConnectionState) {
+                Log.d(tag, "onIceConnectionChange: $iceConnectionState")
+            }
 
-                override fun onIceConnectionReceivingChange(b: Boolean) {
-                    Log.d(tag, "onIceConnectionReceivingChange: $b")
-                }
+            override fun onIceConnectionReceivingChange(b: Boolean) {
+                Log.d(tag, "onIceConnectionReceivingChange: $b")
+            }
 
-                override fun onIceGatheringChange(iceGatheringState: PeerConnection.IceGatheringState) {
-                    Log.d(tag, "onIceGatheringChange: $iceGatheringState")
-                }
+            override fun onIceGatheringChange(iceGatheringState: IceGatheringState) {
+                Log.d(tag, "onIceGatheringChange: $iceGatheringState")
+            }
 
-                override fun onIceCandidate(iceCandidate: IceCandidate) {
-                    val message = JSONObject()
-                    try {
-                        message.put("type", "candidate")
-                        message.put("room", room)
-                        message.put("id", iceCandidate.sdpMid)
-                        message.put("label", iceCandidate.sdpMLineIndex)
-                        message.put("candidate", iceCandidate.sdp)
-                        Log.d(
-                            tag,
-                            "onIceCandidate: sending candidate $message"
-                        )
-                        sendMessage(message)
-                    } catch (e: JSONException) {
-                        e.printStackTrace()
-                        Log.e(tag, e.toString())
-                    }
-                }
-
-                override fun onIceCandidatesRemoved(iceCandidates: Array<IceCandidate>) {
-                    Log.d(tag, "onIceCandidatesRemoved: $iceCandidates")
-                }
-
-                override fun onAddStream(mediaStream: MediaStream?) {
-                }
-
-                override fun onTrack(transceiver: RtpTransceiver?) {
-                    super.onTrack(transceiver)
-
-                    if (transceiver != null && transceiver.receiver != null && transceiver.receiver.track() != null) {
-                        val track = transceiver.receiver.track()
-                        if (track is AudioTrack) {
-                            // Handle incoming audio track
-                            handleIncomingAudioTrack(track)
-                        }
-                    }
-                }
-
-                override fun onRemoveStream(mediaStream: MediaStream) {
-                    Log.d(tag, "onRemoveStream: $mediaStream")
-                }
-
-                override fun onDataChannel(dataChannel: DataChannel) {
-                    Log.d(tag, "onDataChannel: $dataChannel")
-                }
-
-                override fun onRenegotiationNeeded() {
-                    Log.d(tag, "onRenegotiationNeeded: ")
+            override fun onIceCandidate(iceCandidate: IceCandidate) {
+                val message = JSONObject()
+                try {
+                    message.put("type", "candidate")
+                    message.put("room", room)
+                    message.put("id", iceCandidate.sdpMid)
+                    message.put("label", iceCandidate.sdpMLineIndex)
+                    message.put("candidate", iceCandidate.sdp)
+                    Log.d(tag, "onIceCandidate: sending candidate \$message")
+                    socket.emit("message", message)
+                } catch (e: JSONException) {
+                    e.printStackTrace()
+                    Log.e(tag, e.toString())
                 }
             }
-        return factory!!.createPeerConnection(rtcConfig, pcConstraints, pcObserver)
+
+            override fun onIceCandidatesRemoved(iceCandidates: Array<IceCandidate>) {
+                Log.d(tag, "onIceCandidatesRemoved: " + Arrays.toString(iceCandidates))
+            }
+
+            override fun onAddStream(mediaStream: MediaStream) {
+                // Handle add stream
+            }
+
+            override fun onTrack(transceiver: RtpTransceiver) {
+                Log.d(tag, "onTrack: ")
+                if (transceiver != null && transceiver.receiver != null && transceiver.receiver.track() != null) {
+                    val track = transceiver.receiver.track()
+                    if (track is AudioTrack) {
+                        // Handle incoming audio track
+                        Log.d(tag, "track audio ricevuta")
+                        handleIncomingAudioTrack((track as AudioTrack?)!!)
+                    }
+                }
+            }
+
+            override fun onRemoveStream(mediaStream: MediaStream) {
+                Log.d(tag, "onRemoveStream: ")
+            }
+
+            override fun onDataChannel(dataChannel: DataChannel) {
+                Log.d(tag, "onDataChannel: ")
+            }
+
+            override fun onRenegotiationNeeded() {
+                Log.d(tag, "onRenegotiationNeeded: ")
+            }
+
+            override fun onAddTrack(p0: RtpReceiver, mediaStreams: Array<MediaStream>) {}
+        }
+        val url = "stun:stun.l.google.com:19302"
+        val iceServers = listOf(IceServer.builder(url).createIceServer())
+        return factory!!.createPeerConnection(iceServers, pcObserver)
     }
 
     private fun handleIncomingAudioTrack(audioTrack: AudioTrack) {
@@ -506,5 +601,41 @@ class MainActivity : AppCompatActivity() {
             //permission denied
             Toast.makeText(this, "Permission are required" , Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /*
+     * Manage the connection status of WebRTC
+     */
+    private fun changeState(state: SigState) {
+        mState = state
+        runOnUiThread {
+            var stat = ""
+            when (state) {
+                SigState.Connected -> stat = "Connected"
+                SigState.Connecting -> stat = "Connecting..."
+                SigState.Created -> stat = "Created"
+                SigState.Joining -> stat = "joining..."
+                SigState.Joined -> stat = "Joined"
+                SigState.Full -> stat = "Full"
+                SigState.Offering -> stat = "Offering..."
+                SigState.CreatingAnswer -> stat = "CreatingAnswer..."
+                SigState.ReceivedOffer -> stat = "ReceivedOffer"
+                SigState.ReceivedAnswer -> stat = "ReceivedAnswer"
+                SigState.ReceivedCandidate -> stat = "ReceivedCandidate"
+                SigState.Done -> stat = "OK!"
+                else -> {}
+            }
+
+            // Display status (for debug)
+            setStatusText(stat)
+        }
+    }
+
+    /*
+     * Display status to application View (for debug)
+     */
+    private fun setStatusText(stateText: String) {
+        val statusText = findViewById<View>(R.id.status_label) as TextView
+        statusText.text = "${statusText.text} \n $stateText"
     }
 }
